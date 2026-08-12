@@ -1,0 +1,1500 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>DOCSIS Calculator</title>
+<script>
+/*
+Input channel width is the encompassed width, thus
+ * OFDM is 22-190 MHz
+ * OFDMA is 6.4-95 MHz with 25 kHz spacing, or 10-95 MHz with 50 kHz spacing
+
+The following overhead is accounted for:
+ * Cyclic prefix
+ * Pilots
+ * Complementary pilots
+ * PLC
+ * NCP message blocks
+ * Codewords
+   - Assuming no shortened OFDM codewords
+   - Follows CableLabs' algorithm for OFDMA codewords
+ * MAC header
+   - EH: Baseline privacy, upstream + downstream
+   - EH: Packet sequencing, downstream
+ * Segment header
+ * MAP overhead
+   - Profile A is assumed to be 256-QAM
+   - Overhead for a single channel's data grants (this script's OFDMA)
+ * Ethernet header
+ * IPv4 header
+ * TCP header
+
+Mixed modulation/exclusion zone can be defined.
+
+The MER threshold is displayed (average MER),
+based on some common threshold values.
+
+*/
+
+const ofdmSamplingRate = 204.8;
+const ofdmaSamplingRate = 102.4;
+const bytesToBits = 8;
+const bitsPerNcp = 48;
+
+// 3.1/4.0 must support 2000 byte ethernet frames
+// The script allows input up to 9216 bytes (jumbo frame)
+const maxEthernetSize = 2000;
+
+// overhead, bytes
+const overhead = {
+ segment: 8,
+ macHeader: 6, // minimum
+ ehdr: {
+  bp_up2: 3,
+  five_byte: 5,
+  bp_down: 4
+ },
+
+ mapHeader:
+  6 + // mac frame header
+  24 + // mac management message header
+  16, // map header
+ mapEntry: 4, // information element
+
+ ethernet: 18, // 22 bytes with VLAN tagging
+ ipv4: 20, // minimum
+ ipv6: 40, // minimum
+ tcp: 20,  // minimum
+ udp: 8
+};
+
+const ldpc = {
+ long: { size: 16200, info: 14400, parity: 1800, threshold: 11881, minInfo: 10081},
+ medium: { size: 5940, info: 5040, parity: 900, threshold: 3421, minInfo: 2521},
+ short: { size: 1120, info: 840, parity: 280, threshold: 281, minInfo: 420}
+};
+
+const bch = 168;
+const cwHeader = 16; // downstream codeword header
+
+const minislotPatterns = [
+ {}, // index 0 not used
+ // 1-7 are for 50 kHz spacing
+ { body: { p: 2, cp: 2 }, edge: { p: 4, cp: 4 } }, // 1
+ { body: { p: 4, cp: 2 }, edge: { p: 6, cp: 4 } }, // 2
+ { body: { p: 8, cp: 2 }, edge: { p:10, cp: 4 } }, // 3
+ { body: { p:16, cp: 2 }, edge: { p:16, cp: 4 } }, // 4
+ { body: { p: 1, cp: 1 }, edge: { p: 2, cp: 2 } }, // 5
+ { body: { p: 2, cp: 1 }, edge: { p: 3, cp: 2 } }, // 6
+ { body: { p: 4, cp: 1 }, edge: { p: 5, cp: 2 } }, // 7
+ { body: { p: 0, cp: 0 }, edge: { p: 0, cp: 0 } }, // no pilots, for testing
+ 	
+ // 8-14 are for 25 kHz spacing
+ { body: { p: 2, cp: 2 }, edge: { p: 4, cp: 4 } }, // 8
+ { body: { p: 4, cp: 2 }, edge: { p: 6, cp: 4 } }, // 9
+ { body: { p: 8, cp: 2 }, edge: { p:10, cp: 4 } }, // 10
+ { body: { p:16, cp: 2 }, edge: { p:18, cp: 4 } }, // 11
+ { body: { p: 1, cp: 1 }, edge: { p: 2, cp: 2 } }, // 12
+ { body: { p: 2, cp: 1 }, edge: { p: 3, cp: 2 } }, // 13
+ { body: { p: 4, cp: 1 }, edge: { p: 5, cp: 2 } }, // 14
+ { body: { p: 0, cp: 0 }, edge: { p: 0, cp: 0 } }, // no pilots, for testing
+];
+
+const merOfdm = [
+ 0,    // 0: not used
+ 0,    // 1: not used
+ 6,    // 2: QPSK (may only be used for NCP)
+ 0,    // 3: not used
+ 12,   // 4: 16-QAM
+ 0,    // 5: not used
+ 18,   // 6: 64-QAM
+ 21,   // 7: 128-QAM
+ 24,   // 8: 256-QAM
+ 27.5, // 9: 512-QAM
+ 31,   // 10: 1024-QAM
+ 34,   // 11: 2048-QAM
+ 38,   // 12: 4096-QAM
+ 43,   // 13: 8k-QAM
+ 49    // 14: 16k-QAM
+];
+
+const merOfdma = [
+ 0,    // 0, not used
+ 0,    // 1: BPSK (may carry useful data for complementary pilots)
+ 8.5,  // 2: QPSK
+ 12,   // 3: 8-QAM
+ 15,   // 4: 16-QAM
+ 18,   // 5: 32-QAM
+ 20.5, // 6: 64-QAM
+ 23.5, // 7: 128-QAM
+ 26.5, // 8: 256-QAM
+ 29.5, // 9: 512-QAM
+ 32,   // 10: 1024-QAM
+ 36,   // 11: 2048-QAM
+ 40    // 12: 4096-QAM
+];
+
+const modulationNames = [
+ 'not used', // 0
+ 'BPSK',     // 1
+ 'QPSK',     // 2
+ '8-QAM',    // 3
+ '16-QAM',   // 4
+ '32-QAM',   // 5
+ '64-QAM',   // 6
+ '128-QAM',  // 7
+ '256-QAM',  // 8
+ '512-QAM',  // 9
+ '1024-QAM', // 10
+ '2048-QAM', // 11
+ '4096-QAM', // 12
+ '8192-QAM', // 13
+ '16384-QAM' // 14
+];
+
+// Burst and codeword overhead
+//
+// Codeword algorithm by CableLabs
+//
+// Each burst requires a segment header (64 bits)
+
+function burstOverhead(burst){
+ burst.usable = 0;
+ burst.raw = 0;
+ burst.unusedBits = 0;
+ burst.tooSmall = false;
+ burst.fec = { parity: 0 };
+
+ var bitsLeft = burst.size;
+
+ const minGrantSize = ldpc.short.minInfo + ldpc.short.parity;
+
+ if(bitsLeft < minGrantSize){
+  // grant is too small
+  burst.tooSmall = true;
+ }
+ 
+ var lastFull = '';
+ 
+ for(const cw of ['long','medium','short']){
+  burst.fec[cw] = { full: 0, shortened: 0};
+  
+  if(burst.tooSmall == true){
+   // grant is too small
+   continue; // keep going, to get fec[cw] initialized
+  }
+  
+  // full codewords
+  while(bitsLeft >= ldpc[cw].size){
+   lastFull = cw;
+   burst.usable += ldpc[cw].info;
+   burst.raw += ldpc[cw].size;
+   burst.fec[cw].full++;
+   burst.fec.parity += ldpc[cw].parity;
+   
+   bitsLeft -= ldpc[cw].size;
+  }
+  
+  // shortened codeword
+  if(bitsLeft >= ldpc[cw].threshold){
+
+   let info = bitsLeft - ldpc[cw].parity;
+
+   if(cw == "short" && info < ldpc.short.minInfo){
+    // A short's info cannot be less than 420,
+    // so borrow 420 bits from last full (it always borrows that amount).
+    //
+    // The actual borrowing can be skipped in this code,
+    // because it doesn't change the total parity bits.
+
+    burst.fec[lastFull].full--;
+    burst.fec[lastFull].shortened++; // after borrowing bits, it is now a shortened
+   }
+
+   burst.usable += info;
+
+   burst.raw += bitsLeft;
+   burst.fec[cw].shortened++;
+   burst.fec.parity += ldpc[cw].parity;
+   
+   bitsLeft = 0;
+  }
+ }
+
+ // total info bits must be divisible by 8
+ var unusable = burst.usable % 8;
+ burst.usable -= unusable;
+ burst.unusedBits += unusable;
+
+ // the segment header takes away from usable bits
+ burst.segmentHeaderBits = 0;
+ if(burst.usable > 0){
+  burst.segmentHeaderBits = bytesToBits * overhead.segment;
+  burst.usable -= bytesToBits * overhead.segment;
+ }
+
+ burst.unusedBits += bitsLeft;
+ burst.efficiency = burst.size > 0 ? burst.usable / burst.size : 0;
+}
+
+function displayResult(name, r){
+ var div = document.getElementById(name + 'Result');
+
+ var s = '<table class="table-result table-alt-rows">';
+
+ for(const row of r){
+  let info = row.length == 3 ? row[2] : ""; // if 3, there is info
+
+  s += `<tr title="${info}"><td>${row[0]}</td><td>${row[1]}</td></tr>`;
+ }
+
+ s += '</table>';
+ div.innerHTML = s;
+}
+
+function displayOtherOverhead(packetSize, dataRate, r){
+ const headers = [
+  ['Ethernet', overhead.ethernet],
+  ['IPv4', overhead.ipv4],
+  ['TCP', overhead.tcp]
+ ];
+
+ r.push(["User Throughput", ""]);
+
+ var f;
+ for(const hdr of headers){
+  if(hdr[1] >= packetSize){
+   // header consumes the rest
+   f = 0;
+  }else{
+   f = 1-hdr[1]/packetSize;
+  }
+  dataRate *= f;
+  r.push([`&nbsp; After ${hdr[0]} Headers`, `${(dataRate/1000000).toFixed(0)} Mbps`]);
+  packetSize -= hdr[1];
+ }
+}
+
+var mapLengthTime = 0;
+
+function ofdm(){
+ var resultOfdm = [];
+ ofdm2(resultOfdm);
+ displayResult('ofdm', resultOfdm);
+}
+
+function ofdm2(r){
+ var frm = document.getElementById("ofdmForm");
+ var width = parseFloat(frm.width.value);
+ var mod = parseInt(frm.modulation.value);
+ var mer = merOfdm[mod];
+ var cp = parseInt(frm.cp.value);
+ var spacing = parseInt(frm.spacing.value);
+ var ncpMod = parseInt(frm.ncpModulation.value);
+ var density = parseInt(frm.density.value);
+ var ethernetSize = parseInt(frm.ethernetSize.value);
+ var mixedModulationWidth = parseFloat(frm.mixedModulationWidth.value);
+ var mixedModulationMod = parseInt(frm.mixedModulationMod.value);
+ var mixedModulationMer = merOfdm[mixedModulationMod];
+ var excludedSubcarriers = 0;
+ var mapLength = parseFloat(frm.mapLength.value);
+ var grantsMap = parseFloat(document.getElementById("ofdmaForm").grantsMap.value);
+
+ frm.mer.value = '-';
+ frm.result.value = '-';
+
+ // make width multiple of subcarrier spacing
+ width = Math.floor(1000 * width / spacing) * spacing / 1000;
+ mixedModulationWidth = Math.floor(1000 * mixedModulationWidth / spacing) * spacing / 1000;
+
+ var mixColor = "";
+ if(mixedModulationMod == -1){
+  // disabled
+  mixedModulationWidth = 0;
+  mixColor = "#aaa";
+ }
+ frm.mixedModulationMod.style.color = mixColor;
+ frm.mixedModulationWidth.style.color = mixColor;
+
+ frm.ethernetSize.dataset.error = "false";
+ if(isNaN(ethernetSize) || ethernetSize < 18 || ethernetSize > maxEthernetSize){
+  frm.ethernetSize.dataset.error = "true";
+  if(isNaN(ethernetSize)) ethernetSize = 1518;
+  ethernetSize = Math.max(18, ethernetSize); // proceed with 18 or bigger
+  ethernetSize = Math.min(ethernetSize, 9216); // allow up to jumbo frame (not supported by the specification)
+ }
+
+ frm.width.dataset.error = "false";
+ if(isNaN(width) || width < 22 || width > 190){
+  frm.width.dataset.error = "true";
+  r.push(["Error: Encompassed channel width must be 22-190 MHz", ""]);
+  return;
+ }
+
+ frm.mixedModulationWidth.dataset.error = "false";
+ if(isNaN(mixedModulationWidth) || mixedModulationWidth >= width || mixedModulationWidth < 0){
+  frm.mixedModulationWidth.dataset.error = "true";
+  r.push(["Error: Mixed modulation width is invalid", ""]);
+  return;
+ }
+
+ frm.density.dataset.error = "false";
+ if(isNaN(density) || density < 48 || density > 120){
+  frm.density.dataset.error = "true";
+  density = 48; // allow to proceed with default value
+  r.push(["<i>Using default: Pilot density = 48</i>", ""]);
+ }
+
+ if(mixedModulationWidth > 0){
+  if(mixedModulationMod > 0){
+   // implement downstream mixed modulation by using a computed modulation, two weighted halfs
+
+   let mod2 = mod*(width-mixedModulationWidth)/width + mixedModulationMod*mixedModulationWidth/width;
+   let mer2 = mer*(width-mixedModulationWidth)/width + mixedModulationMer*mixedModulationWidth/width;
+
+   let dB = mer - mer2;
+   let inc = dB >= 0 ? 'decrease' : 'increase';
+   
+   let x = 100*(width-mixedModulationWidth)/width;
+
+   r.push(['Mixed Modulation',
+    `${x.toFixed(1)}% ${modulationNames[mod]}<br>
+    ${(100-x).toFixed(1)}% ${modulationNames[mixedModulationMod]}`]);
+   
+   r.push(['MER Threshold', `${Math.abs(dB).toFixed(1)} dB ${inc}`]);
+ 
+   mod = mod2;
+   mer = mer2;
+  }else{
+   // mixed modulation mod is 0, so exclusion
+
+   if(width - mixedModulationWidth < 22){
+    r.push(["Error: The exclusion zone pushes the modulated width below minimum (22 MHz)", ""]);
+    frm.mixedModulationWidth.dataset.error = "true";
+    return;
+   }
+
+   r.push(['Exclusion Zone', `${mixedModulationWidth} MHz`]);
+   excludedSubcarriers = 1000 * mixedModulationWidth / spacing;
+  }
+ }
+
+ if(isNaN(grantsMap)){
+  r.push(["<i>Using default: Grants per MAP = 1</i>", ""]);
+  grantsMap = 1;
+ }
+
+ var subcarriersNcp = bitsPerNcp / ncpMod;
+ var subcarriersPlc = spacing == 25 ? 16 : 8;
+ var subcarriers = 1000 * width / spacing;
+
+ // The pilots are inserted before excluded subcarriers,
+ // so some pilots may fall within an excluded zone.
+ // - Adjust the math, so unusable subcarriers don't count twice
+
+ var continuous = Math.min(120, Math.max(8, Math.floor(density * (subcarriers - excludedSubcarriers) / (190000/spacing)))) + 8;
+ var scattered = Math.ceil((subcarriers - subcarriersPlc - excludedSubcarriers) / 128);
+
+ var usableSubcarriers = subcarriers - continuous - scattered - subcarriersPlc - excludedSubcarriers;
+ var symbolDuration = 1000 / spacing;
+ var symbolDurationCp = symbolDuration + cp/ofdmSamplingRate;
+ var symbolRate = 1000000 / symbolDurationCp;
+
+ r.push(["FFT Size", 1000 * ofdmSamplingRate / spacing]);
+
+ r.push(["Usable Subcarriers",
+  `${usableSubcarriers} of ${subcarriers} (${(100*usableSubcarriers/subcarriers).toFixed(1)}%)`]);
+
+ if(mixedModulationWidth > 0 && mixedModulationMod == 0){
+  // display pilots differently when there is an exclusion zone
+  // - some pilots may fall within it
+
+  // calculate pilots without accounting for excluded subcarriers
+  let continuous2 = Math.min(120, Math.max(8, Math.floor(density * (subcarriers - 0) / (190000/spacing)))) + 8;
+  let scattered2 = Math.ceil((subcarriers - subcarriersPlc - 0) / 128);
+
+  let contInfo = `${continuous2-continuous} continuous fall within the exclusion zone`;
+  r.push(["Continuous Pilots", `${continuous} (${continuous2})`, contInfo]);
+
+  let scatInfo = `${scattered2-scattered} scattered fall within the exclusion zone`;
+  r.push(["Scattered Pilots", `${scattered} (${scattered2})`, scatInfo]);
+
+ }else{
+  r.push(["Continuous Pilots", continuous]);
+  r.push(["Scattered Pilots", scattered]);
+ }
+
+ r.push(["PLC", `${subcarriersPlc} subcarriers`]);
+ r.push(["NCP", `${subcarriersNcp} subcarriers (48 bits)`]);
+ r.push(["Symbol Duration", `${symbolDurationCp} µs (${(100*symbolDuration/symbolDurationCp).toFixed(1)}%)`]);
+ r.push(["Symbol Rate", `${Math.floor(symbolRate)}/sec`]);
+
+ // Each symbol always has minimum two NCP message blocks:
+ // - One is always inserted for CRC
+ // - Each new data codeword inserts one NCP
+ // - If the symbol doesn't begin a new codeword, a null-NCP is inserted
+ // 
+ // A NCP codeword has 24 info bits and 24 parity bits.
+ // 
+ // If the channel is small enough, some symbols don't begin a new data codeword,
+ // because codewords can span symbols.
+ //
+ // Ex: Data codeword 1 begins in symbol n+0 and ends in n+2:
+ //
+ // Symbol n+0: NCP[codeword 1], NCP[CRC] | codeword 1 data
+ // Symbol n+1: NCP[NULL],       NCP[CRC] | codeword 1 data
+ // Symbol n+2: NCP[codeword 2], NCP[CRC] | codeword 1 data, codeword 2 data
+ //
+ // This can be used to make mostly full codewords
+ // - shortened codewords can be left out of the math
+
+ var ncpCrc = symbolRate;
+
+ var subcarriersSecond = usableSubcarriers * symbolRate;
+ var usableSubcarriersSecond = subcarriersSecond - subcarriersNcp * ncpCrc;
+
+ var mapDataRate = 0;
+ var ieCount = 0;
+ var ncpMap = 0;
+
+ if(mapLengthTime > 0){
+  // MAP overhead
+  const QAM256 = 8; // assume profile A is 256-QAM
+  let mapSecond = 1000000 / mapLengthTime;
+  ieCount = 1 + grantsMap; // ends with a null
+  let mapSize = bytesToBits * (overhead.mapHeader + overhead.mapEntry * ieCount);
+  mapSize += ldpc.long.parity + bch + cwHeader; // one MAP with 490 IEs can fit in one codeword
+  mapDataRate = mapSize * mapSecond;
+  ncpMap = mapSecond;
+  subcarriersMapSecond = mapDataRate / QAM256;
+  usableSubcarriersSecond -= subcarriersMapSecond;
+ }
+ 
+
+ var raw = usableSubcarriersSecond * mod; // raw, before NCP overhead
+ var codewords = raw / ldpc.long.size;
+
+ var ncp = codewords + ncpMap;
+
+ // If ncp < symbol rate, there must be some null-NCPs.
+ var ncpNull = Math.max(0, symbolRate - ncp);
+
+ raw -= subcarriersNcp * (ncp + ncpNull) * mod;
+ codewords = raw / ldpc.long.size; // adjust codewords after ncp overhead
+
+ var ncpTotal = ncp + ncpNull + ncpCrc;
+ var ncpTotalSize = bitsPerNcp * ncpTotal;
+
+ raw = codewords * ldpc.long.size;
+ raw += ncpTotalSize;
+ raw += mapDataRate;
+
+ var usable = codewords * (ldpc.long.info - bch - cwHeader);
+
+ r.push(["Main Profile Codewords", `${(codewords/symbolRate).toFixed(2)}/symbol`]);
+
+ r.push(["NCP Overhead",
+  `${(100*(ncpTotal*subcarriersNcp)/subcarriersSecond).toFixed(2)}% (${(ncpTotalSize/1000000).toFixed(2)} Mbps)`]);
+
+ if(mapLengthTime > 0){
+
+  r.push(["MAP Time", `${mapLengthTime} µs`]);
+
+  const mapInfo = "Profile A is set to 256-QAM";
+  r.push(["MAP Overhead",
+   `${(100*subcarriersMapSecond/subcarriersSecond).toFixed(2)}% (${(mapDataRate/1000000).toFixed(2)} Mbps)`, mapInfo]);
+
+  r.push(["&nbsp; IE Count", ieCount]);
+
+  if(ieCount > 490){
+   r.push([`<b style="color:red">* IE Count cannot be > 490 *</b>`, ""]);
+  }
+ }else{
+  r.push(["MAP Time", "-"]);
+ }
+
+ // MAC frame overhead
+ // EHDR:
+ //  FIVE-BYTE: 5 bytes, needed for sequenced packets
+ //  BP_DOWN: 3 bytes, needed for baseline privacy
+ //
+ // Each ethernet frame is wrapped in a MAC frame
+
+ var ehdr = overhead.ehdr.five_byte + overhead.ehdr.bp_down;
+
+ // ratio factor: header size vs total size of MAC frame
+ var fMacHeader =  (overhead.macHeader + ehdr)/(ethernetSize + overhead.macHeader + ehdr);
+ var macHeaderRate = usable * fMacHeader;
+ usable -= macHeaderRate;
+
+ r.push(["Ethernet Frame Size",
+  `${ethernetSize} bytes (${(100*(1-overhead.ethernet/ethernetSize)).toFixed(1)}%)`, ""]);
+
+ r.push(["MAC Frame Overhead",
+  `${(100*fMacHeader).toFixed(2)}%
+  (${(macHeaderRate/1000000).toFixed(2)} Mbps)`]);
+
+ r.push(["Raw Data Rate", `${(raw/1000000).toFixed(0)} Mbps`]);
+
+ r.push(["<b style='color:yellow'>DOCSIS Throughput</b>",
+  `<b style='color:yellow'>${(usable/1000000).toFixed(0)} Mbps (${(100*usable/raw).toFixed(1)}%)</b>`]);
+
+ displayOtherOverhead(ethernetSize, usable, r);
+
+ frm.result.value = `${(usable/1000000).toFixed(0)} Mbps`;
+ frm.mer.value = `${mer.toFixed(1)} dB`;
+}
+
+
+// Complementary pilots carry useful data,
+// but at lower modulation: modulation order minus 4
+// - BPSK is the lowest
+//
+// The other pilots don't carry useful data
+
+function minislotSize(modulation, pattern, subcarriers, frameLength, isEdge){
+ var pat = minislotPatterns[pattern];
+ var slot = isEdge ? pat.edge : pat.body;
+
+ return (subcarriers * frameLength - slot.p - slot.cp) * modulation +
+  slot.cp * Math.max(1, modulation-4);
+}
+
+
+function ofdma(){
+ var resultOfdma = [];
+ ofdma2(resultOfdma);
+ displayResult('ofdma', resultOfdma);
+ // re-calc ofdm after ofdma has been updated (if new MAP overhead) 
+ ofdm();
+}
+
+function ofdma2(r){
+ mapLengthTime = 0;
+ var frm = document.getElementById("ofdmaForm");
+ var width = parseFloat(frm.width.value);
+ var mod = parseInt(frm.modulation.value);
+ var mer = merOfdma[mod];
+ var cp = parseInt(frm.cp.value);
+ var spacing = parseInt(frm.spacing.value);
+ var minislotPattern = parseInt(frm.minislotPattern.value) + (spacing == 50 ? 0 : 8);
+ var ethernetSize = parseInt(frm.ethernetSize.value);
+ var mapLength = parseFloat(frm.mapLength.value);
+ var grantsMap = parseInt(frm.grantsMap.value);
+
+ // make map length on the ofdm tab the same as ofdma
+ document.getElementById("ofdmForm").mapLength.selectedIndex = frm.mapLength.selectedIndex;
+
+ var mixedModulationWidth = parseFloat(frm.mixedModulationWidth.value);
+ var mixedModulationMod = parseInt(frm.mixedModulationMod.value);
+ var mixedModulationMer = merOfdma[mixedModulationMod];
+ var excludedSubcarriers = 0;
+
+ // make width multiple of subcarrier spacing
+ width = Math.floor(1000 * width / spacing) * spacing / 1000;
+ mixedModulationWidth = Math.floor(1000 * mixedModulationWidth / spacing) * spacing / 1000;
+
+ var minWidth = spacing == 25 ? 6.4 : 10;
+ document.getElementById('ofdmaMinWidth').textContent = minWidth;
+
+ frm.mer.value = '-';
+ frm.result.value = '-';
+
+ frm.ethernetSize.dataset.error = "false";
+ if(isNaN(ethernetSize) || ethernetSize < 18 || ethernetSize > maxEthernetSize){
+  frm.ethernetSize.dataset.error = "true";
+  if(isNaN(ethernetSize)) ethernetSize = 1518;
+  ethernetSize = Math.max(18, ethernetSize);
+  ethernetSize = Math.min(ethernetSize, 9216); // allow up to jumbo frame (not supported by the specification)
+ }
+
+ var mixColor = "";
+ if(mixedModulationMod == -1){
+  // disabled
+  mixedModulationWidth = 0;
+  mixColor = "#aaa";
+ }
+ frm.mixedModulationMod.style.color = mixColor;
+ frm.mixedModulationWidth.style.color = mixColor;
+
+ frm.width.dataset.error = "false";
+ if(isNaN(width) || width < minWidth || width > 95){
+  r.push([`Error: Encompassed channel width must be ${minWidth}-95 MHz`, ""]);
+  frm.width.dataset.error = "true";
+  return;
+ }
+
+ frm.mixedModulationWidth.dataset.error = "false";
+ if(isNaN(mixedModulationWidth) || mixedModulationWidth >= width || mixedModulationWidth < 0){
+  r.push(["Error: Mixed modulation width is invalid", ""]);
+  frm.mixedModulationWidth.dataset.error = "true";
+  return;
+ }
+
+ var modulatedWidth = width;
+ if(mixedModulationWidth > 0 && mixedModulationMod == 0){
+  modulatedWidth -= mixedModulationWidth;
+ }
+
+ frm.grantsMap.dataset.error = "false";
+ if(isNaN(grantsMap) || grantsMap < 1){
+  frm.grantsMap.dataset.error = "true";
+  r.push(["Error: Grants is not valid", ""]);
+  return;
+ }
+
+ var subcarriers = 1000*width / spacing;
+ var usableSubcarriers = subcarriers - excludedSubcarriers;
+ var subcarriersMinislot = spacing == 25 ? 16 : 8;
+ var minislots = Math.floor(usableSubcarriers / subcarriersMinislot);
+
+
+ // maximum frame length depends on channel width and subcarrier spacing
+ var maxFrameLength =
+  width >= 72 ? (spacing == 25 ? 9 : 18) :
+  width >= 48 ? (spacing == 25 ? 12 : 24) :
+  (spacing == 25 ? 18 : 36);
+
+ document.getElementById("ofdmaMaxFrameLength").textContent = maxFrameLength;
+ var frameLength = parseInt(frm.frameLength.value);
+
+ frm.frameLength.dataset.error = "false";
+ if(isNaN(frameLength) || frameLength < 6 || frameLength > maxFrameLength){
+  r.push([`Error:`, `Frame length must be 6-${maxFrameLength}<br>with the selected channel width and subcarrier spacing`]);
+  frm.frameLength.dataset.error = "true";
+  return;
+ }
+
+ if(mixedModulationWidth > 0){
+  if(mixedModulationMod > 0){
+   let mer2 = mer*(width-mixedModulationWidth)/width + mixedModulationMer*mixedModulationWidth/width;
+   let dB = mer - mer2;
+   let inc = dB >= 0 ? 'decrease' : 'increase';
+   
+   let x = 100*(width-mixedModulationWidth)/width;
+
+   r.push(
+    ["Mixed Modulation",
+    `${x.toFixed(1)}% ${modulationNames[mod]}<br>
+     ${(100-x).toFixed(1)}% ${modulationNames[mixedModulationMod]}`]);
+
+   r.push(["MER Threshold", `${Math.abs(dB).toFixed(1)} dB ${inc}`]);
+
+   mer = mer2;
+  }else{
+   // mixed modulation mod is 0, so exclusion
+
+   if(width - mixedModulationWidth < minWidth){
+    r.push([`Error: The exclusion zone pushes the modulated width below minimum (${minWidth} MHz)`, ""]);
+    return;
+   }
+
+   r.push(["Exclusion Zone", `${mixedModulationWidth} MHz`]);
+   excludedSubcarriers = 1000 * mixedModulationWidth / spacing;
+  }
+ }
+
+ var symbolDuration = 1000/spacing;
+ var symbolDurationCp = symbolDuration + cp/ofdmaSamplingRate;
+ var unusedSubcarriers = subcarriers - minislots*subcarriersMinislot;
+ var frameDuration = symbolDurationCp * frameLength;
+ var frameRate = 1000000 / frameDuration;
+
+ var dbHigher = 10*Math.log10(modulatedWidth/1.6);
+ r.push(["Channel Power", `P1.6 + ${dbHigher.toFixed(1)} dB`]);
+
+ r.push(["FFT Size", 1000*ofdmaSamplingRate / spacing]);
+
+ var pilots = minislotPatterns[minislotPattern].body.p * minislots;
+ pilots = Math.ceil(pilots / frameLength);
+ const pilotInfo = "Average. Based on pilots in minislot body and frame length";
+ r.push(["Usable Subcarriers", `~${usableSubcarriers-pilots} of ${usableSubcarriers}`, pilotInfo]);
+
+ r.push(["Symbol Duration", `${symbolDurationCp} µs (${(100*symbolDuration/symbolDurationCp).toFixed(1)}%)`]);
+ r.push(["Symbol Rate", `${Math.floor(1000000/symbolDurationCp)}/sec`]);
+ r.push(["Frame Duration", `${frameDuration} µs`]);
+ r.push(["Frame Rate", `${Math.floor(frameRate)}/sec`]);
+
+ var miniInfo = `${subcarriersMinislot} subcarriers per minislot`;
+ r.push([`Minislots per Frame`, `${minislots}`, miniInfo]);
+
+ var unusedInfo = "Only an integer number of minislots can be used";
+ r.push(["Unused Subcarriers", unusedSubcarriers, unusedInfo]);
+
+ // Assign modulation order to minislots.
+ // 
+ // The modulation cannot change within a minislot.
+ //
+ // If mixed modulation, put minislots with secondary modulation lowest in frequency.
+
+ const isEdge = true;
+ const isBody = !isEdge;
+
+ var mappedMinislots = new Array(minislots);
+ var freq = 0;
+ var lastFreqMixed = 1000 * mixedModulationWidth;
+
+ for(let i=0; i < minislots; i++){
+  mappedMinislots[i] = {};
+
+  if(freq < lastFreqMixed && mixedModulationMod != 0){
+   mappedMinislots[i].mod = mixedModulationMod;
+  }else{
+   mappedMinislots[i].mod = mod;
+  }
+
+  // compute minislot size for lookup
+
+  mappedMinislots[i].edgeSize = minislotSize(
+   mappedMinislots[i].mod,
+   minislotPattern,
+   subcarriersMinislot,
+   frameLength,
+   isEdge);
+
+  mappedMinislots[i].bodySize = minislotSize(
+   mappedMinislots[i].mod,
+   minislotPattern,
+   subcarriersMinislot,
+   frameLength,
+   isBody);
+
+  mappedMinislots[i].structure = minislotPatterns[minislotPattern];
+
+  freq += 400; // a minislot is always 400 kHz
+ }
+
+ // display capacity of body and edge minislot
+
+ var displayMod = [mod, mixedModulationMod];
+
+ for(let i=0; i < displayMod.length; i++){
+
+  if(i == 1 && (mixedModulationWidth == 0 || mixedModulationMod == 0)){
+   // don't display second modulation
+   break;
+  }
+
+  let modx = displayMod[i];
+  let edgeSize = minislotSize(modx, minislotPattern, subcarriersMinislot, frameLength, isEdge);
+  let bodySize = minislotSize(modx, minislotPattern, subcarriersMinislot, frameLength, isBody);
+  let minislotRef = subcarriersMinislot * frameLength * modx; // no pilots, for percentage math
+
+  r.push([modulationNames[modx]+":", ""]);
+  r.push(["&nbsp;Minislot Edge", `${edgeSize} bits (${(100*edgeSize/minislotRef).toFixed(1)}%)`]);
+  r.push(["&nbsp;Minislot Body", `${bodySize} bits (${(100*bodySize/minislotRef).toFixed(1)}%)`]);
+ }
+
+ // In this math, a grant cannot reach into the next MAP,
+ // but that is possible in real world scheduling
+
+ mapLengthTime = mapLength * frameDuration;
+ var minislotsSecond = (1000000 / frameDuration) * minislots;
+ var minislotsMap = mapLength * minislots;
+ var ieCount = 1 + grantsMap;
+
+ r.push(["MAP Time", `${mapLengthTime} µs`]);
+ r.push(["MAP Capacity", `${minislotsMap} minislots`]);
+
+ frm.grantsMap.dataset.error = "false";
+ if(grantsMap > minislotsMap){
+  frm.grantsMap.dataset.error = "true";
+  r.push(["<b style='color:red'>* Grants cannot be > MAP capacity *</b>", ""]);
+  return;
+ }
+
+ if(ieCount > 490){
+  frm.grantsMap.dataset.error = "true";
+  r.push([`<b style="color:red">* IE Count cannot be > 490 *</b>`, ""]);
+ }
+
+ // assign approx the same minislot count to each grant
+
+ var bursts = new Array(grantsMap);
+
+ for(let i=0; i < minislotsMap; i++){
+  if(i < bursts.length){
+   // initialize
+   bursts[i] = { minislots: 0 };
+  }
+
+  bursts[i % bursts.length].minislots++;
+ }
+
+ // calculate burst size
+
+ var minislotIndex = 0;
+
+ for(const burst of bursts){
+  burst.size = 0;
+  burst.modulation = [];
+
+  for(let i=0; i < burst.minislots; i++){
+   let slot = mappedMinislots[minislotIndex % minislots];
+   let isEdge = (i == 0); // first minislot in the burst is an edge
+   let slotSize = isEdge ? slot.edgeSize : slot.bodySize;
+   burst.size += slotSize;
+
+   // keep track of used modulation orders
+   burst.modulation.push(slot.mod);
+
+   minislotIndex++;
+  }
+ } 
+
+ var raw = 0;
+ var usable = 0;
+
+ // Codeword and segment header overhead
+ //
+ // Note: Codewords can span frame boundaries
+
+ var tooSmallCount = 0; // minimum grant size is 700 bits
+
+ for(let burst of bursts){
+  burstOverhead(burst);
+
+  if(burst.tooSmall){
+   tooSmallCount++;
+  }else{
+   usable += burst.usable;
+  }
+
+  raw += burst.size;
+ }
+
+ if(tooSmallCount > 0){
+  r.push(["<b style='color:#f00'>* Unusable Grants *</b>", `<b style='color:#f00'>${tooSmallCount}</b>`]);
+ }
+
+ // only the capacity of the minislots in a single MAP was calculated,
+ // multiply the rest
+
+ var f = frameRate / mapLength;
+ usable *= f;
+ raw *= f;
+
+ // MAC frame overhead
+ // EHDR:
+ // BP_UP2, 3 bytes, needed for baseline privacy
+
+ var ehdr = overhead.ehdr.bp_up2;
+
+ var fMacHeader = (overhead.macHeader + ehdr)/(ethernetSize + overhead.macHeader + ehdr);
+ var macHeaderRate = usable * fMacHeader;
+ usable -= macHeaderRate;
+
+ r.push(["Ethernet Frame Size", `${ethernetSize} bytes (${(100*(1-overhead.ethernet/ethernetSize)).toFixed(1)}%)`]);
+
+ r.push(["MAC Frame Overhead",
+  `${(100*fMacHeader).toFixed(2)}%
+  (${(macHeaderRate/1000000).toFixed(2)} Mbps)`]);
+
+ r.push(["Raw Data Rate", `${(raw/1000000).toFixed(0)} Mbps`]);
+
+ r.push(["<b style='color:yellow'>DOCSIS Throughput</b>",
+  `<b style='color:yellow'>${(usable/1000000).toFixed(0)} Mbps (${(100*usable/raw).toFixed(1)}%)</b>`]);
+
+ displayOtherOverhead(ethernetSize, usable, r);
+
+ frm.result.value = `${(usable/1000000).toFixed(0)} Mbps`;
+ frm.mer.value = `${mer.toFixed(1)} dB`;
+}
+
+function ofdmaPower(){
+ var frm = document.getElementById("ofdmaPowerForm");
+ var width = parseFloat(frm.width.value);
+ var p16 = parseFloat(frm.p16.value);
+
+ if(isNaN(p16) || isNaN(width)){
+  frm.result.value = "-";
+  return;
+ }
+
+ var total = p16 + 10 * Math.log10(width/1.6);
+ frm.result.value = total.toFixed(2);
+}
+
+function composite(){
+ var frm = document.getElementById("compositeForm");
+ frm.result.value = "-";
+
+ var lines = frm.values.value.split("\n");
+ var sum = 0;
+ 
+ for(const line of lines){
+  if(line.trim() == ""){
+   continue;
+  }
+
+  let power = parseFloat(line);
+
+  if(isNaN(power)){
+   return;
+  }
+
+  sum += Math.pow(10, power/10);
+ }
+
+ if(sum > 0){
+  let result = 10*Math.log10(sum);
+  frm.result.value = result.toFixed(2);
+ }
+}
+
+function maxTransmit(){
+ var frm = document.getElementById("maxTransmitForm");
+ var maxModem = parseFloat(frm.maxModem.value);
+ var bandwidth = parseFloat(frm.bandwidth.value);
+
+ if(isNaN(maxModem) || isNaN(bandwidth)){
+  frm.p16.value = '-';
+  frm.p64.value = '-';
+  return;
+ }
+
+ var p16 = (bandwidth <= 24) ?
+  (53.2 + (maxModem - 65)) : (maxModem - 10 * Math.log10(bandwidth/1.6));
+
+ frm.p16.value = p16.toFixed(2);
+ frm.p64.value = (p16+6).toFixed(2);
+}
+
+</script>
+<style>
+:root{
+ --input-width: 150px;
+}
+
+[data-error = "true"]{
+ background-color: red !important;
+}
+
+body{
+ color: #fff;
+ background-color: #000;
+ font-family: verdana;
+ font-size: 12pt;
+}
+
+.title{
+ font-family: cursive;
+ color: white;
+ padding-left: 3px;
+ border-left: 1px solid white;
+ font-size: 14pt;
+ font-weight: bold;
+ white-space: nowrap;
+}
+
+p{
+ color: yellow;
+ margin: 15px 0px 2px 0px;
+}
+
+.main-container{
+ display: block;
+}
+
+.tool-container{
+ width: fit-content;
+ margin-top: 5px;
+ display: none;
+ gap: 10px;
+ flex-shrink: 0;
+}
+
+.result-div{
+ width: fit-content;
+ border: 1px solid #567;
+ border-radius: 10px;
+ padding: 3px;
+ display: inline-block;
+}
+
+table{
+ border-color: #faa;
+ border-collapse: collapse;
+ empty-cells: show;
+ background-color: black;
+ color: white;
+}
+
+.table-center{
+ margin-left: auto;
+ margin-right: auto;
+}
+
+th{
+ background-color: #123;
+ white-space: nowrap;
+}
+
+.table-input td{
+ vertical-align: middle;
+}
+
+.table-alt-rows{
+ tbody tr:nth-child(odd){
+  background-color: #234;
+ }
+ tbody tr:nth-child(even){
+  background-color: #123;
+ }
+}
+
+td{
+ padding: 1px 0px 1px 4px;
+ text-align: left;
+ vertical-align: top;
+ white-space: nowrap;
+}
+
+input[type="text"], select, textarea{
+ box-sizing: border-box;
+ outline: none;
+ text-align: center;
+ font-size: inherit;
+ font-family: inherit;
+ width: var(--input-width);
+ border: 1px solid white;
+ border-radius: 5px;
+ color: white;
+ background-color: #123;
+}
+
+textarea{
+ resize: none;
+ overflow:hidden;
+}
+
+.table-grid{
+ border: 1px solid #234;
+ td, th{
+  border: 1px solid #abc;
+ }
+}
+
+.cell-result{
+ color: #123 !important;
+ background-color: #def !important;
+ font-weight: 1000;
+ caret-color: transparent;
+ border-color: #abc !important;
+}
+
+.cell-head{
+ background-color: #456;
+ font-weight: bold;
+ text-align: center;
+ border-bottom: 3px solid #000;
+}
+
+.cell-center td, .cell-center{
+  text-align: center;
+}
+
+.tab-container{
+ border-bottom: 1px solid #aaa;
+ padding-bottom: 5px;
+ display: flex;
+ gap: 5px;
+ align-items: center;
+}
+
+.tab-container button{
+ flex-shrink: 0;
+ padding: 5px;
+ /*margin-bottom: 5px;*/
+ border: 1px solid #777;
+ border-radius: 10px;
+ width: 80px;
+ /*padding-left: 10px;
+ padding-right: 10px;*/
+ color: #fff;
+ background-color: #47a;
+}
+
+.tab-button-active{
+ height: 35px;
+ color: #47a !important;
+ background-color: #fff !important;
+ font-weight: bold;
+}
+
+.tab-container button:hover{
+ cursor: pointer;
+ background-color: #7ad;
+}
+
+input[type='radio']:checked + div{
+ display: flex;
+}
+
+.tab-radio{
+ display: none;
+}
+
+.input-new-group{
+ td{
+  padding-top: 15px;
+ }
+}
+
+</style>
+<script>
+function setBackColorTabButtons(){
+ for(const button of document.querySelectorAll("#tabContainer button")){
+
+  var isChecked = document.getElementById(button.value + 'Radio').checked;
+  button.className = isChecked ? "tab-button-active" : "";
+ }
+}
+
+function tabClick(button){
+ document.getElementById(button.value + 'Radio').checked = true;
+ setBackColorTabButtons();
+}
+
+</script>
+</head>
+<body>
+<form id="ofdmForm"></form>
+<form id="ofdmaForm"></form>
+
+<div class="main-container">
+ <div class="tab-container" id="tabContainer">
+  <button onclick="tabClick(this)" value="ofdm">OFDM</button>
+  <button onclick="tabClick(this)" value="ofdma">OFDMA</button>
+  <div class="title">
+   DOCSIS Calculator
+  </div>
+ </div>
+
+ <input type="radio" id="ofdmRadio" name="tabRadio" class="tab-radio" checked>
+ <div class="tool-container" id="ofdmCalculator">
+  <div>
+   <table border="0" class="table-input">
+    <tr title="Encompassed width">
+     <td>
+      Width [22-190 MHz]
+     </td>
+     <td>
+      <input type="text" value="190" name="width" form="ofdmForm" oninput="ofdm()">
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Modulation
+     </td>
+     <td>
+      <select name="modulation" form="ofdmForm" oninput="ofdm()">
+       <option value="8">256-QAM</option>
+       <option value="10">1024-QAM</option>
+       <option value="11">2048-QAM</option>
+       <option value="12" selected>4096-QAM</option>
+       <option value="13">8192-QAM</option>
+       <option value="14">16384-QAM</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Subcarrier Spacing
+     </td>
+     <td>
+      <select name="spacing" form="ofdmForm" oninput="ofdm()">
+       <option value="25">25 kHz</option>
+       <option value="50" selected>50 kHz</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Cyclic Prefix Length
+     </td>
+     <td>
+      <select name="cp" form="ofdmForm" oninput="ofdm()">
+       <option value="192">192</option>
+       <option value="256">256</option>
+       <option value="512" selected>512</option>
+       <option value="768">768</option>
+       <option value="1024">1024</option>
+       <option value="0">0 (test only)</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      NCP Modulation
+     </td>
+     <td>
+      <select name="ncpModulation" form="ofdmForm" oninput="ofdm()">
+       <option value="2">QPSK</option>
+       <option value="4">16-QAM</option>
+       <option value="6" selected>64-QAM</option>
+      </select>
+     </td>
+    <tr title="Continuous Pilots">
+     <td>
+      Pilot Density [48-120]
+     </td>
+     <td>
+      <input type="text" value="48" name="density" form="ofdmForm" oninput="ofdm()">
+     </td>
+    </tr>
+    <tr title="DOCSIS 3.1/4.0 must support 2000 bytes">
+     <td>
+      Ethernet Frame Size
+     </td>
+     <td>
+      <input type="text" value="1518" name="ethernetSize" form="ofdmForm" oninput="ofdm()">
+     </td>
+    </tr>
+    <tr class="input-new-group">
+     <td>
+      MAP Length
+     </td>
+     <td>
+      <select name="mapLength" form="ofdmForm" oninput="document.getElementById('ofdmaForm').mapLength.selectedIndex = this.selectedIndex; ofdma()">
+       <option value="1">1 Frame</option>
+       <option value="2">2 Frames</option>
+       <option value="3" selected>3 Frames</option>
+       <option value="4">4 Frames</option>
+       <option value="5">5 Frames</option>
+       <option value="5">6 Frames</option>
+       <option value="5">7 Frames</option>
+       <option value="5">8 Frames</option>
+      </select>
+     </td>
+    </tr>
+    <tr class="input-new-group" title="Mixed Modulation">
+     <td>
+      Other Modulation
+     </td>
+     <td>
+      <select name="mixedModulationMod" form="ofdmForm" oninput="ofdm()">
+       <option value="-1" selected>Disabled</option>
+       <option value="0">Exclusion Zone</option>
+       <option value="4">16-QAM</option>
+       <option value="6">64-QAM</option>
+       <option value="7">128-QAM</option>
+       <option value="8">256-QAM</option>
+       <option value="9">512-QAM</option>
+       <option value="10">1024-QAM</option>
+       <option value="11">2048-QAM</option>
+       <option value="12">4096-QAM</option>
+       <option value="13">8192-QAM</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Width of Band
+     </td>
+     <td>
+      <input type="text" value="0" name="mixedModulationWidth" form="ofdmForm" oninput="ofdm()">
+     </td>
+    </tr>
+
+    <tr class="input-new-group" title="Depends on the operator">
+     <td>
+      MER Threshold
+     </td>
+     <td>
+      <input type="text" value="0 dB" readonly name="mer" class="cell-result" form="ofdmForm">
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Throughput [max]
+     </td>
+     <td>
+      <input type="text" value="0 Mbps" readonly name="result" class="cell-result" form="ofdmForm">
+     </td>
+    </tr>
+   </table>
+  </div>
+  <div>
+   <div class="result-div" id="ofdmResult"></div>
+  </div>
+ </div><!-- tool container -->
+
+ <!-- ==================== OFDMA ==================== -->
+ <input type="radio" id="ofdmaRadio" name="tabRadio" class="tab-radio">
+ <div class="tool-container" id="ofdmaCalculator">
+
+  <div>
+   <table border="0" class="table-input">
+    <tr title="Encompassed width">
+     <td>
+      Width [<span id="ofdmaMinWidth">6.4</span>-95 MHz]
+     </td>
+     <td>
+      <input type="text" value="95" name="width" form="ofdmaForm" oninput="ofdma()">
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Modulation
+     </td>
+     <td>
+      <select name="modulation" form="ofdmaForm" oninput="ofdma()">
+       <option value="6">64-QAM</option>
+       <option value="7">128-QAM</option>
+       <option value="8">256-QAM</option>
+       <option value="9">512-QAM</option>
+       <option value="10">1024-QAM</option>
+       <option value="11">2048-QAM</option>
+       <option value="12" selected>4096-QAM</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Subcarrier Spacing
+     </td>
+     <td>
+      <select name="spacing" form="ofdmaForm" oninput="ofdma()">
+       <option value="25" selected>25 kHz</option>
+       <option value="50">50 kHz</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Cyclic Prefix Length
+     </td>
+     <td>
+      <select name="cp" form="ofdmaForm" oninput="ofdma()">
+       <option value="96">96</option>
+       <option value="128">128</option>
+       <option value="160">160</option>
+       <option value="192" selected>192</option>
+       <option value="224">224</option>
+       <option value="256">256</option>
+       <option value="288">288</option>
+       <option value="320">320</option>
+       <option value="384">384</option>
+       <option value="512">512</option>
+       <option value="640">640</option>
+       <option value="0">0 (test only)</option>
+      </select>
+     </td>
+    </tr>
+    <tr title="Pilots + Complementary Pilots [body]">
+     <td>
+      Minislot Pattern
+     </td>
+     <td>
+      <select name="minislotPattern" form="ofdmaForm" oninput="ofdma()">
+       <option value="1">2+2</option>
+       <option value="2">4+2</option>
+       <option value="3">8+2</option>
+       <option value="4" selected>16+2</option>
+       <option value="5">1+1</option>
+       <option value="6">2+1</option>
+       <option value="7">4+1</option>
+       <option value="8">0+0 (test only)</option>
+      </select>
+     </td>
+    </tr>
+    <tr title="Maximum frame length depends on channel width and subcarrier spacing">
+     <td>
+      Frame Length [6-<span id="ofdmaMaxFrameLength">9</span>]
+     </td>
+     <td>
+      <input type="text" name="frameLength" value="9" form="ofdmaForm" oninput="ofdma()">
+     </td>
+    </tr>
+    <tr title="DOCSIS 3.1/4.0 must support 2000 bytes">
+     <td>
+      Ethernet Frame Size
+     </td>
+     <td>
+      <input type="text" value="1518" name="ethernetSize" form="ofdmaForm" oninput="ofdma()">
+     </td>
+    </tr>
+    <tr class="input-new-group">
+     <td>
+      MAP Length
+     </td>
+     <td>
+      <select name="mapLength" form="ofdmaForm" oninput="ofdma()">
+       <option value="1">1 Frame</option>
+       <option value="2">2 Frames</option>
+       <option value="3" selected>3 Frames</option>
+       <option value="4">4 Frames</option>
+       <option value="5">5 Frames</option>
+       <option value="5">6 Frames</option>
+       <option value="5">7 Frames</option>
+       <option value="5">8 Frames</option>
+      </select>
+     </td>
+    </tr>
+    <tr title="All grants get approx the same number of minislots">
+     <td>
+      Grants per MAP
+     </td>
+     <td>
+      <input type="text" value="35" name="grantsMap" form="ofdmaForm" oninput="ofdma()">
+     </td>
+    </tr>
+    <tr class="input-new-group" title="Mixed Modulation">
+     <td>
+      Other Modulation
+     </td>
+     <td>
+      <select name="mixedModulationMod" form="ofdmaForm" oninput="ofdma()">
+       <option value="-1" selected>Disabled</option>
+       <option value="0">Exclusion Zone</option>
+       <option value="2">QPSK</option>
+       <option value="3">8-QAM</option>
+       <option value="4">16-QAM</option>
+       <option value="5">32-QAM</option>
+       <option value="6">64-QAM</option>
+       <option value="7">128-QAM</option>
+       <option value="8">256-QAM</option>
+       <option value="9">512-QAM</option>
+       <option value="10">1024-QAM</option>
+       <option value="11">2048-QAM</option>
+      </select>
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Width of Band
+     </td>
+     <td>
+       <input type="text" value="0" name="mixedModulationWidth" form="ofdmaForm" oninput="ofdma()">
+     </td>
+    </tr>
+    <tr class="input-new-group">
+     <td>
+      MER Threshold
+     </td>
+     <td>
+      <input type="text" value="38 dB" readonly name="mer" class="cell-result" form="ofdmaForm">
+     </td>
+    </tr>
+    <tr>
+     <td>
+      Throughput [max]
+     </td>
+     <td>
+      <input type="text" value="" readonly name="result" class="cell-result" form="ofdmaForm">
+     </td>
+    </tr>
+   </table>
+  </div>
+  <div>
+   <div class="result-div" id="ofdmaResult"></div>
+  </div>
+ </div><!-- tool container -->
+</div><!-- main container -->
+<script>
+setBackColorTabButtons();
+ofdma(); // calls ofdm
+</script>
+</body>
+</html>
