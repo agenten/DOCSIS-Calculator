@@ -1,3 +1,5 @@
+Live: https://agenten.github.io/DOCSIS-Calculator/
+
 Input channel width is the encompassed width, thus
  * OFDM is 22-190 MHz
  * OFDMA is 6.4-95 MHz with 25 kHz spacing, or 10-95 MHz with 50 kHz spacing
